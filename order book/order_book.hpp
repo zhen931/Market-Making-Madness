@@ -44,4 +44,33 @@ struct Order {
     Order* next  = nullptr;
     PriceLevel* level = nullptr;
 };
+
+// FIFO queue of orders resting at one price
+struct PriceLevel {
+    Price price = 0;
+    Quantity total_qty = 0;       
+    std::size_t order_count = 0;
+    Order* head = nullptr; // oldest - front of FIFO (time priority)
+    Order* tail = nullptr; // newest - back of FIFO
+ 
+    [[nodiscard]] bool empty() const noexcept { return head == nullptr; }
+ 
+    // Append to tail (newest). O(1)
+    void push_back(Order* o) noexcept {
+        o->next = nullptr; // nothing behind new order
+        o->prev = tail; // last order is in front of new order
+
+        if (tail) {
+            tail->next = o; // tail points to new order
+        }
+        else {
+            head = o; // if queue empty then new order is head
+        }
+
+        tail = o;
+        o->level = this; // o joined PriceLevel queue
+        total_qty += o->qty_open; // add o to running price total
+        ++order_count;
+    }
+};
 }
