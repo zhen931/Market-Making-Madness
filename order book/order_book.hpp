@@ -73,4 +73,22 @@ struct PriceLevel {
         ++order_count;
     }
 };
+
+// OrderPool: deque arena + free list 
+// Stable Order* (std::deque never relocates existing elements on growth);
+// freed slots are recycled via a LIFO free list
+class OrderPool {
+public:
+    explicit OrderPool(std::size_t reserve = 0);
+ 
+    [[nodiscard]] Order* allocate(); // pop a free slot or grow the arena
+    void deallocate(Order* o); // return a slot to the free list
+ 
+    [[nodiscard]] std::size_t capacity() const noexcept { return arena_.size(); }
+    [[nodiscard]] std::size_t free_count() const noexcept { return free_.size(); }
+ 
+private:
+    std::deque<Order> arena_; // owns Order storage; pointer-stable on growth
+    std::vector<Order*> free_; // recycled slots
+};
 }
