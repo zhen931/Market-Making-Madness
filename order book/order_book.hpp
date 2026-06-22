@@ -91,4 +91,67 @@ private:
     std::deque<Order> arena_; // owns Order storage; pointer-stable on growth
     std::vector<Order*> free_; // recycled slots
 };
+
+// ---- OrderBook: one instrument's CLOB ---------------------------------------
+class OrderBook {
+public:
+    explicit OrderBook(InstrumentId instrument, std::size_t pool_reserve = 0);
+ 
+    // --- Resting-order mutations ---------------------------------------------
+ 
+    // Insert a non-marketable limit remainder as a resting order. The book
+    // copies the business fields of `proto`, takes a pooled slot, wires the
+    // intrusive links / level / index, and returns a stable pointer to the
+    // resting Order.
+    // Preconditions: the order does not cross the book (marketability is the
+    // matching layer's job), proto.qty_open > 0, and proto.id is unique among
+    // resting orders. proto's prev/next/level fields are ignored.
+    Order* add_resting(const Order& proto);
+ 
+    // Cancel a resting order by id. O(1) splice + index erase (+ level removal
+    // if it became empty). Returns false if no such resting order exists.
+    bool cancel(OrderId id);
+ 
+    // Modify a resting order's price and/or open quantity. Priority rule:
+    //   * pure quantity DECREASE at the same price -> keeps queue position;
+    //   * quantity INCREASE, or any price change    -> loses time priority and
+    //     is re-queued at the TAIL of the target price level.
+    // `new_qty` is the desired new OPEN/remaining quantity. Returns a pointer to
+    // the (same, possibly relocated) Order, or nullptr if not found / new_qty<=0.
+    // Structural only: does NOT check whether new_price crosses the book - the
+    // matching layer must re-evaluate marketability after a modify.
+    Order* modify(OrderId id, Price new_price, Quantity new_qty);
+ 
+    // --- Best bid/offer (O(1)) -----------------------------------------------
+    [[nodiscard]] bool  has_bids() const noexcept { return !bids_.empty(); }
+    [[nodiscard]] bool  has_asks() const noexcept { return !asks_.empty(); }
+    [[nodiscard]] Price best_bid() const noexcept;  // precondition: has_bids()
+    [[nodiscard]] Price best_ask() const noexcept;  // precondition: has_asks()
+    [[nodiscard]] const PriceLevel* best_bid_level() const noexcept;  // null if empty
+    [[nodiscard]] const PriceLevel* best_ask_level() const noexcept;  // null if empty
+ 
+    // --- Depth / analytics ----------------------------------------------------
+    [[nodiscard]] Quantity    volume_at(Side side, Price price) const;  // 0 if no level
+    [[nodiscard]] std::size_t level_count(Side side) const noexcept;
+ 
+    // --- Lookup ---------------------------------------------------------------
+    [[nodiscard]] const Order* find(OrderId id) const;  // nullptr if absent
+ 
+    [[nodiscard]] InstrumentId instrument() const noexcept { return instrument_; }
+ 
+private:
+    // Bids: highest price first. Asks: lowest price first. begin() == the touch.
+    using BidMap = std::map<Price, PriceLevel, std::greater<Price>>;
+    using AskMap = std::map<Price, PriceLevel, std::less<Price>>;
+ 
+    PriceLevel& level_for_insert(Side side, Price price);  // get-or-create
+    void        erase_level(Side side, Price price) noexcept;
+ 
+    InstrumentId                        instrument_;
+    BidMap                              bids_;
+    AskMap                              asks_;
+    std::unordered_map<OrderId, Order*> index_;  // id -> resting Order* (O(1))
+    OrderPool                           pool_;
+};
+
 }
