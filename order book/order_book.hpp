@@ -1,11 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Central limit order book
@@ -72,6 +74,29 @@ struct PriceLevel {
         total_qty += o->qty_open; // add o to running price total
         ++order_count;
     }
+
+    // Remove an arbitrary node from the FIFO: relink neighbours, fix head/tail,
+    // total_qty -= o->qty_open (its live remaining qty AT CALL TIME), --order_count.
+    // O(1). The matcher zeroes o->qty_open for a fully-consumed maker before
+    // calling unlink, so this subtracts 0 in that case; a cancel calls it with
+    // the order's live qty. One rule keeps `total_qty == sum(qty_open)` either way.
+    void unlink(Order* o) noexcept {
+        if (o->prev) { o->prev->next = o->next; } else { head = o->next; }
+        if (o->next) { o->next->prev = o->prev; } else { tail = o->prev; }
+        o->prev = nullptr;
+        o->next = nullptr;
+        o->level = nullptr;
+        total_qty -= o->qty_open;
+        --order_count;
+    }
+
+    // Pop the oldest (head) node and return it; == unlink(head). nullptr if empty.
+    [[nodiscard]] Order* pop_front() noexcept {
+        if (!head) { return nullptr; }
+        Order* o = head;
+        unlink(o);
+        return o;
+    }
 };
 
 // OrderPool: deque arena + free list 
@@ -92,36 +117,67 @@ private:
     std::vector<Order*> free_; // recycled slots
 };
 
+// ---- Matcher output & per-participant execution report ----------------------
+
+// Trade: the matcher's primitive output. One per maker/taker fill. Carries BOTH
+// identities so the FillDispatcher can fan out to each side without re-deriving.
+struct Trade {
+    InstrumentId  instrument = 0;
+    Price         price = 0;        // the MAKER's resting price (ticks)
+    Quantity      qty = 0;          // matched quantity (> 0)
+    OrderId       maker_order_id = 0;
+    ParticipantId maker = 0;
+    Side          maker_side = Side::Buy;   // resting side
+    OrderId       taker_order_id = 0;
+    ParticipantId taker = 0;
+    Side          taker_side = Side::Buy;   // == aggressor side
+    Timestamp     ts = 0;
+};
+
+enum class Liquidity : std::uint8_t { Maker, Taker };
+
+// ExecutionReport: enriched, per-participant. The book never fills in `fees` or
+// `running_position` (it tracks neither); the FillDispatcher stamps those when it
+// converts each Trade into one ExecutionReport per side.
+struct ExecutionReport {
+    OrderId      order_id = 0;          // THIS participant's order
+    InstrumentId instrument = 0;
+    Side         side = Side::Buy;      // THIS participant's side of the fill
+    Price        price = 0;
+    Quantity     qty = 0;
+    Liquidity    liquidity = Liquidity::Maker;
+    double       fees = 0.0;            // from the fee model (stamped at dispatch)
+    Quantity     running_position = 0;  // this participant's net position AFTER the fill
+    Timestamp    ts = 0;
+};
+
 // ---- OrderBook: one instrument's CLOB ---------------------------------------
+// Tier 1 matching engine: price-time-priority CLOB for a single instrument.
+// `submit` matches the aggressor against the resting book and returns the Trades
+// it generated; `cancel` removes a resting order. The book takes OWNERSHIP of any
+// Order* handed to submit (see ORDER_BOOK_TIER1.md Â§6): after the call the caller
+// must never touch/free/reuse it. The book rests it (Limit remainder) or returns
+// it to the pool (fully filled, or IOC remainder). The pool is OWNED EXTERNALLY
+// (the gateway/kernel allocates + stamps the Order before submit, Â§8); the book
+// only deallocates back into it, keeping the pool conserved (Â§13).
 class OrderBook {
 public:
-    explicit OrderBook(InstrumentId instrument, std::size_t pool_reserve = 0);
- 
-    // --- Resting-order mutations ---------------------------------------------
- 
-    // Insert a non-marketable limit remainder as a resting order. The book
-    // copies the business fields of `proto`, takes a pooled slot, wires the
-    // intrusive links / level / index, and returns a stable pointer to the
-    // resting Order.
-    // Preconditions: the order does not cross the book (marketability is the
-    // matching layer's job), proto.qty_open > 0, and proto.id is unique among
-    // resting orders. proto's prev/next/level fields are ignored.
-    Order* add_resting(const Order& proto);
- 
-    // Cancel a resting order by id. O(1) splice + index erase (+ level removal
-    // if it became empty). Returns false if no such resting order exists.
+    OrderBook(InstrumentId instrument, OrderPool& pool)
+        : instrument_(instrument), pool_(pool) {}
+
+    // --- Matching mutations (event-driven; called by the DES kernel) ----------
+
+    // Match `o` against the resting book (price-time priority), rest the unfilled
+    // remainder IFF it is a Limit, and return every Trade generated this call.
+    // Takes ownership of `o` (Â§6). Trade price is always the maker's resting price.
+    // Market/FOK are rejected in Tier 1 (deallocated, empty result).
+    [[nodiscard]] std::vector<Trade> submit(Order* o);
+
+    // Cancel a resting order by id. O(1) splice + index erase (+ level removal if
+    // it became empty), then the Order is returned to the pool. Returns false if
+    // no such resting order exists (unknown id, or already fully filled).
     bool cancel(OrderId id);
- 
-    // Modify a resting order's price and/or open quantity. Priority rule:
-    //   * pure quantity DECREASE at the same price -> keeps queue position;
-    //   * quantity INCREASE, or any price change    -> loses time priority and
-    //     is re-queued at the TAIL of the target price level.
-    // `new_qty` is the desired new OPEN/remaining quantity. Returns a pointer to
-    // the (same, possibly relocated) Order, or nullptr if not found / new_qty<=0.
-    // Structural only: does NOT check whether new_price crosses the book - the
-    // matching layer must re-evaluate marketability after a modify.
-    Order* modify(OrderId id, Price new_price, Quantity new_qty);
- 
+
     // --- Best bid/offer (O(1)) -----------------------------------------------
     [[nodiscard]] bool  has_bids() const noexcept { return !bids_.empty(); }
     [[nodiscard]] bool  has_asks() const noexcept { return !asks_.empty(); }
@@ -129,29 +185,85 @@ public:
     [[nodiscard]] Price best_ask() const noexcept;  // precondition: has_asks()
     [[nodiscard]] const PriceLevel* best_bid_level() const noexcept;  // null if empty
     [[nodiscard]] const PriceLevel* best_ask_level() const noexcept;  // null if empty
- 
+
     // --- Depth / analytics ----------------------------------------------------
-    [[nodiscard]] Quantity    volume_at(Side side, Price price) const;  // 0 if no level
+    // Resting open quantity at one (side, price); 0 if no such level.
+    [[nodiscard]] Quantity    qty_at(Side side, Price price) const noexcept;
+    [[nodiscard]] Quantity    volume_at(Side side, Price price) const noexcept {  // alias
+        return qty_at(side, price);
+    }
+    // Up to `n` (price, total_qty) pairs, best-first.
+    [[nodiscard]] std::vector<std::pair<Price, Quantity>> depth(Side side, std::size_t n) const;
     [[nodiscard]] std::size_t level_count(Side side) const noexcept;
- 
+
     // --- Lookup ---------------------------------------------------------------
     [[nodiscard]] const Order* find(OrderId id) const;  // nullptr if absent
- 
+
     [[nodiscard]] InstrumentId instrument() const noexcept { return instrument_; }
- 
+
 private:
     // Bids: highest price first. Asks: lowest price first. begin() == the touch.
     using BidMap = std::map<Price, PriceLevel, std::greater<Price>>;
     using AskMap = std::map<Price, PriceLevel, std::less<Price>>;
- 
+
+    // GOTCHA (Â§9): bids_ and asks_ are DIFFERENT types (different comparators), so
+    // `(side==Buy) ? asks_ : bids_` does not compile. submit picks the opposing
+    // map at the call site and passes it into this templated matcher. Defined in
+    // the header because it is a template.
+    template <class OppMap>
+    std::vector<Trade> match_against(Order* o, OppMap& opp);
+
     PriceLevel& level_for_insert(Side side, Price price);  // get-or-create
     void        erase_level(Side side, Price price) noexcept;
- 
+    void        rest(Order* o);  // push_back to own-side level + index it
+
     InstrumentId                        instrument_;
+    OrderPool&                          pool_;   // owned externally (Â§8)
     BidMap                              bids_;
     AskMap                              asks_;
     std::unordered_map<OrderId, Order*> index_;  // id -> resting Order* (O(1))
-    OrderPool                           pool_;
 };
+
+// match_against: price-time priority sweep of the opposing book. The aggressor `o`
+// crosses to each marketable maker at the MAKER's price, FIFO within a level.
+// Fully consumed makers are unlinked, de-indexed, and returned to the pool here.
+template <class OppMap>
+std::vector<Trade> OrderBook::match_against(Order* o, OppMap& opp) {
+    std::vector<Trade> trades;
+    while (o->qty_open > 0 && !opp.empty()) {
+        auto it = opp.begin();              // best opposing level
+        PriceLevel& lvl = it->second;
+        const bool marketable = (o->side == Side::Buy)
+            ? lvl.price <= o->price          // ask <= our bid
+            : lvl.price >= o->price;         // bid >= our ask
+        if (!marketable) { break; }
+
+        while (o->qty_open > 0 && !lvl.empty()) {  // FIFO within the level
+            Order*   maker = lvl.head;
+            // TODO(tier2): self-trade prevention â if maker->owner == o->owner,
+            // skip/cancel per policy instead of crossing. MVP does not consult it.
+            Quantity fill  = std::min(o->qty_open, maker->qty_open);
+
+            trades.push_back(Trade{
+                instrument_, maker->price, fill,
+                maker->id, maker->owner, maker->side,
+                o->id,     o->owner,     o->side,
+                o->ts_accept,
+            });
+
+            o->qty_open     -= fill;
+            maker->qty_open -= fill;
+            lvl.total_qty   -= fill;          // keep the invariant
+
+            if (maker->qty_open == 0) {       // maker fully filled
+                lvl.unlink(maker);            // total_qty -= 0 here (already 0)
+                index_.erase(maker->id);
+                pool_.deallocate(maker);
+            }
+        }
+        if (lvl.empty()) { opp.erase(it); }   // drop the emptied level
+    }
+    return trades;
+}
 
 }
